@@ -4,30 +4,41 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type config struct {
-	listenAddr  string
-	devinBin    string
-	devinModel  string
-	timeout     time.Duration
-	maxHistory  int
-	authToken   string
-	proxyURL    string
-	systemIntro string
-	ttsPrefix   string
+	listenAddr        string
+	devinBin          string
+	devinModel        string
+	botToken          string
+	timeout           time.Duration
+	maxHistory        int
+	authToken         string
+	proxyURL          string
+	systemIntro       string
+	ttsPrefix         string
+	classifierOn      bool
+	classifierBaseURL string
+	classifierAPIKey  string
+	classifierModel   string
+	classifierTimeout time.Duration
+	classifierExtra   string
 }
 
 func envOr(key, def string) string {
@@ -46,10 +57,16 @@ func loadConfig() config {
 	if err != nil || maxHistory < 1 {
 		maxHistory = 10
 	}
+	classifierTimeout, err := time.ParseDuration(envOr("CLASSIFIER_TIMEOUT", "6s"))
+	if err != nil {
+		classifierTimeout = 6 * time.Second
+	}
+	classifierOn := envOr("CLASSIFIER_ENABLED", "true") != "false"
 	return config{
 		listenAddr: envOr("LISTEN_ADDR", ":8765"),
 		devinBin:   envOr("DEVIN_BIN", "devin"),
-		devinModel: envOr("DEVIN_MODEL", "swe-2-high"),
+		devinModel: envOr("DEVIN_MODEL", "swe-2-flash-medium"),
+		botToken:   envOr("BOT_TOKEN", ""),
 		timeout:    timeout,
 		maxHistory: maxHistory,
 		authToken:  os.Getenv("AUTH_TOKEN"),
@@ -57,8 +74,16 @@ func loadConfig() config {
 		systemIntro: envOr("SYSTEM_PROMPT",
 			"Ты — голосовой помощник умной колонки. Твой ответ будет зачитан вслух. "+
 				"Отвечай кратко и по-русски, обычной связной речью: без разметки, списков, "+
-				"таблиц, кода и эмодзи. Просто ответь текстом, не используй никакие инструменты."),
-		ttsPrefix: os.Getenv("TTS_PREFIX"),
+				"таблиц, кода и эмодзи. Если для ответа нужны актуальные данные "+
+				"(погода, новости, курсы валют, расписание) — используй веб-поиск. "+
+				"Другие инструменты не используй и никаких действий не выполняй."),
+		ttsPrefix:         os.Getenv("TTS_PREFIX"),
+		classifierOn:      classifierOn && os.Getenv("CLASSIFIER_API_KEY") != "",
+		classifierBaseURL: envOr("CLASSIFIER_BASE_URL", "https://api.z.ai/api/paas/v4"),
+		classifierAPIKey:  os.Getenv("CLASSIFIER_API_KEY"),
+		classifierModel:   envOr("CLASSIFIER_MODEL", "glm-4.5-air"),
+		classifierTimeout: classifierTimeout,
+		classifierExtra:   os.Getenv("CLASSIFIER_EXTRA_BODY"),
 	}
 }
 
@@ -106,8 +131,9 @@ func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
 // --- core ---
 
 type bridge struct {
-	cfg config
-	mu  sync.Mutex // devin runs are serialized: one prompt at a time
+	cfg            config
+	mu             sync.Mutex // devin runs are serialized: one prompt at a time
+	classifierHTTP *http.Client
 }
 
 func (b *bridge) buildPrompt(messages []chatMessage) string {
@@ -222,6 +248,145 @@ func lastUserMessage(messages []chatMessage) string {
 	return ""
 }
 
+// --- Quasar routing classifier fast-path ---
+//
+// Quasar Bridge has no separate classifier backend: it sends its classifier
+// instruction (which quotes all three {"route":"..."} literals) plus the user
+// phrase to the same /v1/chat/completions. Answering those through `devin -p`
+// costs several seconds and holds the devin mutex, so we detect them and
+// forward to a cheap fast model instead.
+
+var routeRe = regexp.MustCompile(`"route"\s*:\s*"(home|llm|yandex)"`)
+
+func isClassifierRequest(messages []chatMessage) bool {
+	var sb strings.Builder
+	for _, m := range messages {
+		sb.WriteString(m.Content)
+	}
+	compact := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, sb.String())
+	return strings.Contains(compact, `{"route":"home"}`) &&
+		strings.Contains(compact, `{"route":"llm"}`) &&
+		strings.Contains(compact, `{"route":"yandex"}`)
+}
+
+func (b *bridge) newClassifierClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	switch p := envOr("CLASSIFIER_PROXY", "env"); p {
+	case "direct":
+		tr.Proxy = nil // measured faster than the loaded local proxy; fallback degrades to yandex
+	case "", "env":
+	default:
+		if u, err := url.Parse(p); err == nil {
+			tr.Proxy = http.ProxyURL(u)
+		}
+	}
+	if b.cfg.proxyURL != "" && envOr("CLASSIFIER_PROXY", "env") == "env" {
+		if u, err := url.Parse(b.cfg.proxyURL); err == nil {
+			tr.Proxy = http.ProxyURL(u)
+		}
+	}
+	return &http.Client{Transport: tr}
+}
+
+// classify returns one of "home", "llm", "yandex"; any failure degrades to
+// "yandex" so Quasar always gets a valid fast route instead of an error wait.
+// Two hedged attempts: upstream latency spikes occasionally stall the first
+// try past the deadline while a parallel retry answers in ~1s.
+func (b *bridge) classify(ctx context.Context, messages []chatMessage) string {
+	ctx, cancel := context.WithTimeout(ctx, b.cfg.classifierTimeout)
+	defer cancel()
+
+	results := make(chan string, 1)
+	go b.classifyAttempt(ctx, messages, results)
+	select {
+	case r := <-results:
+		return r
+	case <-time.After(1500 * time.Millisecond):
+	}
+	go b.classifyAttempt(ctx, messages, results)
+	select {
+	case r := <-results:
+		return r
+	case <-ctx.Done():
+		return "yandex"
+	}
+}
+
+func (b *bridge) classifyAttempt(ctx context.Context, messages []chatMessage, results chan<- string) {
+	if r := b.classifyOnce(ctx, messages); r != "" {
+		select {
+		case results <- r:
+		default:
+		}
+	}
+}
+
+func (b *bridge) classifyOnce(ctx context.Context, messages []chatMessage) string {
+	body := map[string]any{
+		"model":       b.cfg.classifierModel,
+		"messages":    messages,
+		"max_tokens":  256,
+		"temperature": 0,
+		"stream":      false,
+		// GLM thinking mode adds ~5s of reasoning before the answer — a
+		// classifier must be fast. Backends that don't know this param ignore it.
+		"thinking": map[string]any{"type": "disabled"},
+	}
+	if b.cfg.classifierExtra != "" {
+		var extra map[string]any
+		if json.Unmarshal([]byte(b.cfg.classifierExtra), &extra) == nil {
+			for k, v := range extra {
+				body[k] = v
+			}
+		}
+	}
+	payload, _ := json.Marshal(body)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimSuffix(b.cfg.classifierBaseURL, "/")+"/chat/completions",
+		bytes.NewReader(payload))
+	if err != nil {
+		log.Printf("classifier request build error: %v", err)
+		return ""
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+b.cfg.classifierAPIKey)
+
+	resp, err := b.classifierHTTP.Do(req)
+	if err != nil {
+		if ctx.Err() == nil { // hedged sibling's cancellation is expected, not an error
+			log.Printf("classifier backend error: %v", err)
+		}
+		return ""
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("classifier backend status %d", resp.StatusCode)
+		return ""
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out.Choices) == 0 {
+		log.Printf("classifier decode error: %v", err)
+		return ""
+	}
+	if m := routeRe.FindStringSubmatch(out.Choices[0].Message.Content); m != nil {
+		return m[1]
+	}
+	log.Printf("classifier: no route in reply %q", truncate(out.Choices[0].Message.Content, 200))
+	return ""
+}
+
 func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "POST required")
@@ -238,10 +403,19 @@ func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqID := fmt.Sprintf("%x", time.Now().UnixNano()&0xFFFFFF)
-	prompt := b.buildPrompt(req.Messages)
 	log.Printf("req=%s from=%s model=%q messages=%d question=%q",
 		reqID, r.RemoteAddr, req.Model, len(req.Messages), truncate(lastUserMessage(req.Messages), 500))
 
+	// Quasar routing classifier: answer via the cheap backend, not devin.
+	if b.cfg.classifierOn && isClassifierRequest(req.Messages) {
+		start := time.Now()
+		route := b.classify(r.Context(), req.Messages)
+		log.Printf("req=%s classifier route=%s in %s", reqID, route, time.Since(start).Round(time.Millisecond))
+		b.writeReply(w, req.Stream, `{"route":"`+route+`"}`)
+		return
+	}
+
+	prompt := b.buildPrompt(req.Messages)
 	start := time.Now()
 	text, err := b.askDevin(r.Context(), prompt)
 	if err != nil {
@@ -253,11 +427,13 @@ func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// TTS markup prefix (e.g. <speaker voice="zahar" emotion="evil">) applies to
 	// the whole reply; Quasar Bridge strips it before showing text.
-	spoken := b.cfg.ttsPrefix + text
+	b.writeReply(w, req.Stream, b.cfg.ttsPrefix+text)
+}
 
-	resp := completionResponse(b.cfg.devinModel, spoken)
+func (b *bridge) writeReply(w http.ResponseWriter, stream bool, text string) {
+	resp := completionResponse(b.cfg.devinModel, text)
 	w.Header().Set("Content-Type", "application/json")
-	if req.Stream {
+	if stream {
 		// Minimal SSE: one chunk with the whole reply, then [DONE].
 		w.Header().Set("Content-Type", "text/event-stream")
 		chunk := map[string]any{
@@ -265,7 +441,7 @@ func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"created": resp.Created, "model": resp.Model,
 			"choices": []map[string]any{{
 				"index":         0,
-				"delta":         map[string]string{"role": "assistant", "content": spoken},
+				"delta":         map[string]string{"role": "assistant", "content": text},
 				"finish_reason": "stop",
 			}},
 		}
@@ -299,6 +475,7 @@ func main() {
 
 	cfg := loadConfig()
 	b := &bridge{cfg: cfg}
+	b.classifierHTTP = b.newClassifierClient()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -323,7 +500,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", cfg.listenAddr, err)
 	}
-	log.Printf("devin-llm-bridge listening on %s (model=%s, timeout=%s, tts_prefix=%q)",
-		cfg.listenAddr, cfg.devinModel, cfg.timeout, cfg.ttsPrefix)
+	log.Printf("devin-llm-bridge listening on %s (model=%s, timeout=%s, tts_prefix=%q, classifier=%v:%s)",
+		cfg.listenAddr, cfg.devinModel, cfg.timeout, cfg.ttsPrefix, cfg.classifierOn, cfg.classifierModel)
 	log.Fatal(http.Serve(ln, mux))
 }
