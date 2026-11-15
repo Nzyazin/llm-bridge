@@ -203,10 +203,11 @@ func completionResponse(model, text string) chatCompletion {
 
 func truncate(s string, n int) string {
 	s = strings.Join(strings.Fields(s), " ")
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(runes[:n]) + "..."
 }
 
 func lastUserMessage(messages []chatMessage) string {
@@ -285,6 +286,10 @@ func (b *bridge) auth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func main() {
+	// All log lines go to stdout: Start-Process redirects stdout to bridge.log,
+	// stderr is reserved for actual panics/runtime errors.
+	log.SetOutput(os.Stdout)
+
 	cfg := loadConfig()
 	b := &bridge{cfg: cfg}
 
