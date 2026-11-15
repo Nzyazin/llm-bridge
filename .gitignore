@@ -1,4 +1,6 @@
 *.exe
+*.exe~
+.idea/
 work/
 *.log
 *.err
