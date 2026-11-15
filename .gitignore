@@ -5,4 +5,5 @@ work/
 *.log
 *.err
 run/bridge.pid
+run/secrets.ps1
 .env

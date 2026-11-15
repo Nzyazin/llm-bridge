@@ -1,4 +1,4 @@
-// devin-llm-bridge exposes Devin CLI (`devin -p`) as an OpenAI-compatible
+// llm-bridge exposes Devin CLI (`devin -p`) as an OpenAI-compatible
 // /v1/chat/completions endpoint so that OpenAI clients (e.g. Quasar Bridge on a
 // Yandex Station) can talk to Devin models.
 package main
@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ type config struct {
 	devinBin          string
 	devinModel        string
 	botToken          string
+	botChatID         string
 	timeout           time.Duration
 	maxHistory        int
 	authToken         string
@@ -34,11 +36,10 @@ type config struct {
 	systemIntro       string
 	ttsPrefix         string
 	classifierOn      bool
-	classifierBaseURL string
-	classifierAPIKey  string
-	classifierModel   string
 	classifierTimeout time.Duration
-	classifierExtra   string
+	opencodeBin       string
+	opencodeModel     string
+	opencodeVariant   string
 }
 
 func envOr(key, def string) string {
@@ -61,12 +62,12 @@ func loadConfig() config {
 	if err != nil {
 		classifierTimeout = 6 * time.Second
 	}
-	classifierOn := envOr("CLASSIFIER_ENABLED", "true") != "false"
 	return config{
 		listenAddr: envOr("LISTEN_ADDR", ":8765"),
 		devinBin:   envOr("DEVIN_BIN", "devin"),
 		devinModel: envOr("DEVIN_MODEL", "swe-2-flash-medium"),
 		botToken:   envOr("BOT_TOKEN", ""),
+		botChatID:  envOr("BOT_ID", ""),
 		timeout:    timeout,
 		maxHistory: maxHistory,
 		authToken:  os.Getenv("AUTH_TOKEN"),
@@ -78,12 +79,11 @@ func loadConfig() config {
 				"(погода, новости, курсы валют, расписание) — используй веб-поиск. "+
 				"Другие инструменты не используй и никаких действий не выполняй."),
 		ttsPrefix:         os.Getenv("TTS_PREFIX"),
-		classifierOn:      classifierOn && os.Getenv("CLASSIFIER_API_KEY") != "",
-		classifierBaseURL: envOr("CLASSIFIER_BASE_URL", "https://api.z.ai/api/paas/v4"),
-		classifierAPIKey:  os.Getenv("CLASSIFIER_API_KEY"),
-		classifierModel:   envOr("CLASSIFIER_MODEL", "glm-4.5-air"),
+		classifierOn:      envOr("CLASSIFIER_ENABLED", "true") != "false",
 		classifierTimeout: classifierTimeout,
-		classifierExtra:   os.Getenv("CLASSIFIER_EXTRA_BODY"),
+		opencodeBin:       envOr("OPENCODE_BIN", "opencode"),
+		opencodeModel:     envOr("OPENCODE_MODEL", "opencode/flint-40b-free"),
+		opencodeVariant:   envOr("OPENCODE_VARIANT", "low"),
 	}
 }
 
@@ -131,9 +131,18 @@ func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
 // --- core ---
 
 type bridge struct {
-	cfg            config
-	mu             sync.Mutex // devin runs are serialized: one prompt at a time
-	classifierHTTP *http.Client
+	cfg    config
+	mu     sync.Mutex // devin runs are serialized: one prompt at a time
+	tgHTTP *http.Client
+
+	replyMu   sync.Mutex
+	lastReply map[string]string    // client IP -> last devin reply, for "forward it to telegram"
+	lastSent  map[string]sentEntry // client IP -> last forwarded payload: repeats are refused
+}
+
+type sentEntry struct {
+	text string
+	at   time.Time
 }
 
 func (b *bridge) buildPrompt(messages []chatMessage) string {
@@ -248,6 +257,61 @@ func lastUserMessage(messages []chatMessage) string {
 	return ""
 }
 
+func lastAssistantMessage(messages []chatMessage) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "assistant" {
+			return messages[i].Content
+		}
+	}
+	return ""
+}
+
+// TTS markup is prepended to replies meant for the speaker; it must not leak
+// into forwarded text.
+func stripTTSTag(s, prefix string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), prefix))
+}
+
+// Quasar sends no assistant history (messages are [system, user] only), so
+// "forward the last reply" needs a bridge-side cache keyed by client IP.
+func clientIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
+func (b *bridge) rememberReply(client, text string) {
+	b.replyMu.Lock()
+	defer b.replyMu.Unlock()
+	b.lastReply[client] = text
+}
+
+func (b *bridge) lastReplyFor(client string) string {
+	b.replyMu.Lock()
+	defer b.replyMu.Unlock()
+	return b.lastReply[client]
+}
+
+// Quasar re-sends the previous question on a bare "спроси нейросеть", which
+// replays side-effecting commands like "отправь в телеграм". Identical
+// payloads are refused within this window (quasar context ttl is 300s).
+const telegramDedupTTL = 10 * time.Minute
+
+func (b *bridge) alreadySent(client, text string) bool {
+	b.replyMu.Lock()
+	defer b.replyMu.Unlock()
+	e, ok := b.lastSent[client]
+	return ok && e.text == text && time.Since(e.at) < telegramDedupTTL
+}
+
+func (b *bridge) rememberSent(client, text string) {
+	b.replyMu.Lock()
+	defer b.replyMu.Unlock()
+	b.lastSent[client] = sentEntry{text: text, at: time.Now()}
+}
+
 // --- Quasar routing classifier fast-path ---
 //
 // Quasar Bridge has no separate classifier backend: it sends its classifier
@@ -272,25 +336,6 @@ func isClassifierRequest(messages []chatMessage) bool {
 	return strings.Contains(compact, `{"route":"home"}`) &&
 		strings.Contains(compact, `{"route":"llm"}`) &&
 		strings.Contains(compact, `{"route":"yandex"}`)
-}
-
-func (b *bridge) newClassifierClient() *http.Client {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	switch p := envOr("CLASSIFIER_PROXY", "env"); p {
-	case "direct":
-		tr.Proxy = nil // measured faster than the loaded local proxy; fallback degrades to yandex
-	case "", "env":
-	default:
-		if u, err := url.Parse(p); err == nil {
-			tr.Proxy = http.ProxyURL(u)
-		}
-	}
-	if b.cfg.proxyURL != "" && envOr("CLASSIFIER_PROXY", "env") == "env" {
-		if u, err := url.Parse(b.cfg.proxyURL); err == nil {
-			tr.Proxy = http.ProxyURL(u)
-		}
-	}
-	return &http.Client{Transport: tr}
 }
 
 // classify returns one of "home", "llm", "yandex"; any failure degrades to
@@ -318,7 +363,9 @@ func (b *bridge) classify(ctx context.Context, messages []chatMessage) string {
 }
 
 func (b *bridge) classifyAttempt(ctx context.Context, messages []chatMessage, results chan<- string) {
-	if r := b.classifyOnce(ctx, messages); r != "" {
+	// The official opencode CLI is the only identity Zen's anonymous free tier
+	// accepts, so classification is a `opencode run` spawn, not an HTTP call.
+	if r := b.classifyViaOpencode(ctx, messages); r != "" {
 		select {
 		case results <- r:
 		default:
@@ -326,65 +373,159 @@ func (b *bridge) classifyAttempt(ctx context.Context, messages []chatMessage, re
 	}
 }
 
-func (b *bridge) classifyOnce(ctx context.Context, messages []chatMessage) string {
-	body := map[string]any{
-		"model":       b.cfg.classifierModel,
-		"messages":    messages,
-		"max_tokens":  256,
-		"temperature": 0,
-		"stream":      false,
-		// GLM thinking mode adds ~5s of reasoning before the answer — a
-		// classifier must be fast. Backends that don't know this param ignore it.
-		"thinking": map[string]any{"type": "disabled"},
+// classifyViaOpencode shells out to `opencode run --format json`, scans the
+// NDJSON event stream for the last text part and extracts the route from it.
+//
+// A fixed --dir matters: opencode embeds the workdir into its ~11K-token agent
+// system prompt, so a fresh temp dir per call busts the provider prompt cache
+// and each classify costs ~10s. A stable dir caches the prefix → ~2s.
+// opencode.json in that dir disables tools: the model must not go agentic and
+// burn the budget on bash calls.
+func (b *bridge) classifyViaOpencode(ctx context.Context, messages []chatMessage) string {
+	var sb strings.Builder
+	for _, m := range messages {
+		sb.WriteString(m.Content)
+		sb.WriteString("\n\n")
 	}
-	if b.cfg.classifierExtra != "" {
-		var extra map[string]any
-		if json.Unmarshal([]byte(b.cfg.classifierExtra), &extra) == nil {
-			for k, v := range extra {
-				body[k] = v
-			}
+	prompt := strings.TrimSpace(sb.String())
+	if prompt == "" {
+		return ""
+	}
+
+	workDir := filepath.Join(os.TempDir(), "llm-bridge-cls")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		log.Printf("classifier(opencode) mkdir: %v", err)
+		return ""
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "opencode.json"),
+		[]byte(`{"tools":{"bash":false,"edit":false,"write":false,"patch":false,"task":false,"skill":false,"webfetch":false,"read":false,"grep":false,"glob":false,"list":false,"todoread":false,"todowrite":false}}`),
+		0o644); err != nil {
+		log.Printf("classifier(opencode) write config: %v", err)
+	}
+
+	args := []string{"run", "--format", "json", "--pure", "-m", b.cfg.opencodeModel, "--dir", workDir}
+	if b.cfg.opencodeVariant != "" {
+		args = append(args, "--variant", b.cfg.opencodeVariant)
+	}
+	args = append(args, prompt)
+	cmd := exec.CommandContext(ctx, b.cfg.opencodeBin, args...)
+	cmd.Dir = workDir
+	cmd.Env = os.Environ()
+
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			log.Printf("classifier(opencode) exit %v: %s", err, truncate(string(ee.Stderr), 300))
+		} else {
+			log.Printf("classifier(opencode): %v", err)
+		}
+		return ""
+	}
+
+	var text string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") || !strings.Contains(line, `"type":"text"`) {
+			continue
+		}
+		var ev struct {
+			Part struct {
+				Text string `json:"text"`
+			} `json:"part"`
+		}
+		if json.Unmarshal([]byte(line), &ev) == nil && ev.Part.Text != "" {
+			text = ev.Part.Text
 		}
 	}
-	payload, _ := json.Marshal(body)
+	if m := routeRe.FindStringSubmatch(text); m != nil {
+		return m[1]
+	}
+	log.Printf("classifier(opencode): no route in reply %q", truncate(text, 200))
+	return ""
+}
 
+// --- local voice actions (no devin round-trip) ---
+
+var (
+	// No \b/\w: Go's RE2 defines them ASCII-only — Cyrillic is "non-word", so
+	// \bв and \bтелеграм\b never match. Substring matching is fine here.
+	telegramCmdRe   = regexp.MustCompile(`(?i)^\s*(?:отправь|отправить|перешли|переслать|скинь|кинь|скинуть)\s+(.+?)\s*[.!?…]*\s*$`)
+	telegramPrepRe  = regexp.MustCompile(`(?i)в\s+телеграм\p{L}*`)
+	telegramWordRe  = regexp.MustCompile(`(?i)телеграм\p{L}*`)
+	telegramPronoun = map[string]bool{"это": true, "его": true, "её": true, "их": true}
+)
+
+// telegramBody reports whether msg is a "send to telegram" command and returns
+// the explicit payload. "" payload means "forward the last assistant reply".
+func telegramBody(msg string) (string, bool) {
+	m := telegramCmdRe.FindStringSubmatch(msg)
+	if m == nil {
+		return "", false
+	}
+	rest := m[1]
+	hasTG := telegramWordRe.MatchString(rest)
+	rest = telegramPrepRe.ReplaceAllString(rest, " ")
+	rest = telegramWordRe.ReplaceAllString(rest, " ")
+	rest = strings.Trim(rest, " ,.:;—-")
+	if telegramPronoun[strings.ToLower(rest)] {
+		return "", true
+	}
+	return rest, hasTG
+}
+
+func (b *bridge) actionTelegram(ctx context.Context, messages []chatMessage, client string) string {
+	text, _ := telegramBody(lastUserMessage(messages))
+	if text == "" {
+		text = stripTTSTag(lastAssistantMessage(messages), b.cfg.ttsPrefix)
+	}
+	if text == "" {
+		text = b.lastReplyFor(client)
+	}
+	if text == "" {
+		return "Нечего отправить."
+	}
+	if b.alreadySent(client, text) {
+		return "Уже отправлено."
+	}
+	if err := b.sendTelegram(ctx, text); err != nil {
+		log.Printf("telegram send: %v", err)
+		return "Не получилось отправить."
+	}
+	b.rememberSent(client, text)
+	return "Отправлено."
+}
+
+func (b *bridge) sendTelegram(ctx context.Context, text string) error {
+	if b.cfg.botToken == "" || b.cfg.botChatID == "" {
+		return fmt.Errorf("telegram not configured: set BOT_TOKEN and BOT_ID")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	payload, _ := json.Marshal(map[string]any{
+		"chat_id": b.cfg.botChatID,
+		"text":    text,
+	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimSuffix(b.cfg.classifierBaseURL, "/")+"/chat/completions",
+		"https://api.telegram.org/bot"+b.cfg.botToken+"/sendMessage",
 		bytes.NewReader(payload))
 	if err != nil {
-		log.Printf("classifier request build error: %v", err)
-		return ""
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+b.cfg.classifierAPIKey)
-
-	resp, err := b.classifierHTTP.Do(req)
+	resp, err := b.tgHTTP.Do(req)
 	if err != nil {
-		if ctx.Err() == nil { // hedged sibling's cancellation is expected, not an error
-			log.Printf("classifier backend error: %v", err)
-		}
-		return ""
+		return err
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
 	}
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("classifier backend status %d", resp.StatusCode)
-		return ""
+	json.NewDecoder(resp.Body).Decode(&out)
+	if resp.StatusCode != http.StatusOK || !out.OK {
+		return fmt.Errorf("telegram api status %d: %s", resp.StatusCode, out.Description)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out.Choices) == 0 {
-		log.Printf("classifier decode error: %v", err)
-		return ""
-	}
-	if m := routeRe.FindStringSubmatch(out.Choices[0].Message.Content); m != nil {
-		return m[1]
-	}
-	log.Printf("classifier: no route in reply %q", truncate(out.Choices[0].Message.Content, 200))
-	return ""
+	return nil
 }
 
 func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -403,15 +544,41 @@ func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqID := fmt.Sprintf("%x", time.Now().UnixNano()&0xFFFFFF)
-	log.Printf("req=%s from=%s model=%q messages=%d question=%q",
-		reqID, r.RemoteAddr, req.Model, len(req.Messages), truncate(lastUserMessage(req.Messages), 500))
+	// model= is the effective model (req.Model from the client is ignored;
+	// the bridge always runs cfg.devinModel), asked= is what was requested.
+	log.Printf("req=%s from=%s model=%q asked=%q messages=%d question=%q",
+		reqID, r.RemoteAddr, b.cfg.devinModel, req.Model, len(req.Messages), truncate(lastUserMessage(req.Messages), 500))
 
-	// Quasar routing classifier: answer via the cheap backend, not devin.
-	if b.cfg.classifierOn && isClassifierRequest(req.Messages) {
+	// Quasar routing classifier: detected before the telegram action because
+	// classify prompts quote the user phrase verbatim and would misfire it.
+	// opencode backend when enabled; otherwise devin answers the prompt and
+	// we extract the route literal from its reply.
+	if isClassifierRequest(req.Messages) {
 		start := time.Now()
-		route := b.classify(r.Context(), req.Messages)
+		route := ""
+		if b.cfg.classifierOn {
+			route = b.classify(r.Context(), req.Messages)
+		} else if text, err := b.askDevin(r.Context(), b.buildPrompt(req.Messages)); err == nil {
+			if m := routeRe.FindStringSubmatch(text); m != nil {
+				route = m[1]
+			}
+		} else {
+			log.Printf("req=%s classifier devin error after %s: %v", reqID, time.Since(start).Round(time.Millisecond), err)
+		}
+		if route == "" {
+			route = "yandex"
+		}
 		log.Printf("req=%s classifier route=%s in %s", reqID, route, time.Since(start).Round(time.Millisecond))
 		b.writeReply(w, req.Stream, `{"route":"`+route+`"}`)
+		return
+	}
+
+	// Local actions bypass devin: fast (~0.5s) and no mutex.
+	if _, ok := telegramBody(lastUserMessage(req.Messages)); ok {
+		start := time.Now()
+		text := b.actionTelegram(r.Context(), req.Messages, clientIP(r.RemoteAddr))
+		log.Printf("req=%s telegram action in %s: %q", reqID, time.Since(start).Round(time.Millisecond), truncate(text, 200))
+		b.writeReply(w, req.Stream, b.cfg.ttsPrefix+text)
 		return
 	}
 
@@ -424,6 +591,7 @@ func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("req=%s answered in %s: %q", reqID, time.Since(start).Round(time.Millisecond), truncate(text, 500))
+	b.rememberReply(clientIP(r.RemoteAddr), text)
 
 	// TTS markup prefix (e.g. <speaker voice="zahar" emotion="evil">) applies to
 	// the whole reply; Quasar Bridge strips it before showing text.
@@ -474,8 +642,14 @@ func main() {
 	log.SetOutput(os.Stdout)
 
 	cfg := loadConfig()
-	b := &bridge{cfg: cfg}
-	b.classifierHTTP = b.newClassifierClient()
+	b := &bridge{cfg: cfg, lastReply: make(map[string]string), lastSent: make(map[string]sentEntry)}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if cfg.proxyURL != "" {
+		if u, err := url.Parse(cfg.proxyURL); err == nil {
+			tr.Proxy = http.ProxyURL(u)
+		}
+	}
+	b.tgHTTP = &http.Client{Transport: tr, Timeout: 15 * time.Second}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -490,7 +664,7 @@ func main() {
 				"id":       cfg.devinModel,
 				"object":   "model",
 				"created":  0,
-				"owned_by": "devin-llm-bridge",
+				"owned_by": "llm-bridge",
 			}},
 		})
 	}))
@@ -500,7 +674,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", cfg.listenAddr, err)
 	}
-	log.Printf("devin-llm-bridge listening on %s (model=%s, timeout=%s, tts_prefix=%q, classifier=%v:%s)",
-		cfg.listenAddr, cfg.devinModel, cfg.timeout, cfg.ttsPrefix, cfg.classifierOn, cfg.classifierModel)
+	log.Printf("llm-bridge listening on %s (model=%s, timeout=%s, tts_prefix=%q, classifier=%v:%s, telegram=%v)",
+		cfg.listenAddr, cfg.devinModel, cfg.timeout, cfg.ttsPrefix, cfg.classifierOn, cfg.opencodeModel, cfg.botToken != "" && cfg.botChatID != "")
 	log.Fatal(http.Serve(ln, mux))
 }

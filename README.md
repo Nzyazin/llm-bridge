@@ -1,4 +1,4 @@
-# devin-llm-bridge
+# llm-bridge
 
 OpenAI-compatible HTTP адаптер над `devin -p`: принимает `/v1/chat/completions`,
 вызывает Devin CLI (SWE-2 и другие модели) и возвращает ответ в формате OpenAI.
@@ -9,8 +9,8 @@ OpenAI-compatible HTTP адаптер над `devin -p`: принимает `/v1
 ## Сборка и запуск
 
 ```sh
-go build -o devin-llm-bridge.exe .
-.\devin-llm-bridge.exe
+go build -o llm-bridge.exe .
+.\llm-bridge.exe
 ```
 
 Слушает `:8765` по умолчанию.
@@ -27,12 +27,13 @@ go build -o devin-llm-bridge.exe .
 | `SYSTEM_PROMPT` | голосовой ассистент | префикс промпта |
 | `PROXY_URL` | — | если задан, прокидывается в `HTTP(S)_PROXY`/`ALL_PROXY` дочернего процесса |
 | `AUTH_TOKEN` | — | если задан, требует `Authorization: Bearer <token>` |
-| `CLASSIFIER_BASE_URL` | `https://api.z.ai/api/paas/v4` | OpenAI-совместимый endpoint классификатора |
-| `CLASSIFIER_API_KEY` | — | ключ классификатора (пусто → fast-path выключен) |
-| `CLASSIFIER_MODEL` | `glm-4.5-air` | модель классификатора |
+| `CLASSIFIER_ENABLED` | `true` | `false` — classify-запросы уходят в `devin -p` (медленно, mutex) |
 | `CLASSIFIER_TIMEOUT` | `6s` | бюджет на классификацию (две попытки) |
-| `CLASSIFIER_PROXY` | `env` | `direct` — без прокси; URL — свой прокси; `env` — как у процесса |
-| `CLASSIFIER_EXTRA` | — | JSON, мержится в тело запроса классификатора |
+| `OPENCODE_BIN` | `opencode` | путь к opencode CLI |
+| `OPENCODE_MODEL` | `opencode/flint-40b-free` | модель классификатора |
+| `OPENCODE_VARIANT` | `low` | вариант/effort модели opencode |
+| `BOT_TOKEN` | — | токен Telegram-бота для «отправь в телеграм» |
+| `BOT_ID` | — | chat_id, куда пересылать |
 | `TTS_PREFIX` | — | префикс TTS-разметки к ответам (например `<speaker voice="zahar">`) |
 
 ## Классификатор маршрутов Quasar
@@ -42,11 +43,21 @@ Quasar Bridge шлёт classify-запросы (системный промпт 
 `{"route":"` во входящих сообщениях и отвечает дешёвой моделью за ~1 с
 вместо запуска `devin -p` (5–8 с и блокировка общего mutex'а).
 
+- Классифицирует бесплатный `opencode/flint-40b-free` — запуском
+  `opencode run --pure` (anon free-tier Zen принимает только официальный CLI,
+  ключа не нужно).
 - Ответ всегда валидный JSON `{"route":"..."}`; при ошибке/таймауте —
   `{"route":"yandex"}` (эквивалент `classifier.on_error: yandex` в Quasar).
 - Две попытки со сдвигом 1.5 с — первая вернувшаяся побеждает.
-- `thinking: disabled` отправляется по умолчанию (GLM reasoning добавлял ~5 с);
-  переопределяется через `CLASSIFIER_EXTRA`.
+
+## Локальные действия
+
+Фраза «отправь в телеграм …» (а также «перешли», «скинь», «кинь») выполняется
+самим мостом через Bot API `sendMessage` — без запуска devin, ~0.5 с. Текст
+берётся из фразы; «отправь это/его/её/их» пересылает последний ответ ассистента
+из истории `messages` (TTS-разметка срезается). Нужны `BOT_TOKEN` и `BOT_ID` —
+на проде лежат в gitignored `run/secrets.ps1`, который подключает
+`start-bridge.ps1`; при ошибке отправки колонка озвучивает «Не получилось отправить.»
 
 ## Эндпоинты
 
