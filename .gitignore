@@ -1,4 +1,6 @@
 *.exe
 work/
 *.log
+*.err
+run/
 .env
