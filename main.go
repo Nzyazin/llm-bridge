@@ -27,6 +27,7 @@ type config struct {
 	authToken   string
 	proxyURL    string
 	systemIntro string
+	ttsPrefix   string
 }
 
 func envOr(key, def string) string {
@@ -57,6 +58,7 @@ func loadConfig() config {
 			"Ты — голосовой помощник умной колонки. Твой ответ будет зачитан вслух. "+
 				"Отвечай кратко и по-русски, обычной связной речью: без разметки, списков, "+
 				"таблиц, кода и эмодзи. Просто ответь текстом, не используй никакие инструменты."),
+		ttsPrefix: os.Getenv("TTS_PREFIX"),
 	}
 }
 
@@ -248,7 +250,11 @@ func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("req=%s answered in %s: %q", reqID, time.Since(start).Round(time.Millisecond), truncate(text, 500))
 
-	resp := completionResponse(b.cfg.devinModel, text)
+	// TTS markup prefix (e.g. <speaker voice="zahar" emotion="evil">) applies to
+	// the whole reply; Quasar Bridge strips it before showing text.
+	spoken := b.cfg.ttsPrefix + text
+
+	resp := completionResponse(b.cfg.devinModel, spoken)
 	w.Header().Set("Content-Type", "application/json")
 	if req.Stream {
 		// Minimal SSE: one chunk with the whole reply, then [DONE].
@@ -258,7 +264,7 @@ func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"created": resp.Created, "model": resp.Model,
 			"choices": []map[string]any{{
 				"index":         0,
-				"delta":         map[string]string{"role": "assistant", "content": text},
+				"delta":         map[string]string{"role": "assistant", "content": spoken},
 				"finish_reason": "stop",
 			}},
 		}
@@ -316,7 +322,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", cfg.listenAddr, err)
 	}
-	log.Printf("devin-llm-bridge listening on %s (model=%s, timeout=%s)",
-		cfg.listenAddr, cfg.devinModel, cfg.timeout)
+	log.Printf("devin-llm-bridge listening on %s (model=%s, timeout=%s, tts_prefix=%q)",
+		cfg.listenAddr, cfg.devinModel, cfg.timeout, cfg.ttsPrefix)
 	log.Fatal(http.Serve(ln, mux))
 }
