@@ -201,6 +201,23 @@ func completionResponse(model, text string) chatCompletion {
 	return r
 }
 
+func truncate(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+func lastUserMessage(messages []chatMessage) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return messages[i].Content
+		}
+	}
+	return ""
+}
+
 func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "POST required")
@@ -216,15 +233,19 @@ func (b *bridge) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	reqID := fmt.Sprintf("%x", time.Now().UnixNano()&0xFFFFFF)
 	prompt := b.buildPrompt(req.Messages)
-	log.Printf("request: model=%q messages=%d prompt_len=%d", req.Model, len(req.Messages), len(prompt))
+	log.Printf("req=%s from=%s model=%q messages=%d question=%q",
+		reqID, r.RemoteAddr, req.Model, len(req.Messages), truncate(lastUserMessage(req.Messages), 500))
 
+	start := time.Now()
 	text, err := b.askDevin(r.Context(), prompt)
 	if err != nil {
-		log.Printf("devin error: %v", err)
+		log.Printf("req=%s devin error after %s: %v", reqID, time.Since(start).Round(time.Millisecond), err)
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	log.Printf("req=%s answered in %s: %q", reqID, time.Since(start).Round(time.Millisecond), truncate(text, 500))
 
 	resp := completionResponse(b.cfg.devinModel, text)
 	w.Header().Set("Content-Type", "application/json")
