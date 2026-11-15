@@ -2,5 +2,5 @@
 work/
 *.log
 *.err
-run/
+run/bridge.pid
 .env

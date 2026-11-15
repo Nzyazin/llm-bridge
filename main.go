@@ -154,6 +154,7 @@ func (b *bridge) askDevin(ctx context.Context, prompt string) (string, error) {
 	args := []string{
 		"-p",
 		"--model", b.cfg.devinModel,
+		"--permission-mode", "auto", // explicit: auto-approves read-only tools only, overrides DEVIN_PERMISSION_MODE env
 		"--respect-workspace-trust", "false",
 		"--", prompt,
 	}
