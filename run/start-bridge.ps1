@@ -4,6 +4,9 @@ $env:TTS_PREFIX = '<speaker voice="zahar" emotion="evil">'
 $env:CLASSIFIER_ENABLED = 'false'
 $env:OPENCODE_MODEL = 'opencode/flint-40b-free'
 $env:OPENCODE_VARIANT = 'low'
+# Voice session: persistent paseo agent in the voice-agent workspace.
+$env:PASEO_PROVIDER = 'devin/swe-2-flash-medium'
+$env:PASEO_WORKSPACE = 'wks_b080f9f7ce6d8e09'
 # Telegram forwarding («отправь в телеграм …»): bot token and target chat id
 # live in gitignored run/secrets.ps1 ($env:BOT_TOKEN / $env:BOT_ID).
 if (Test-Path "$PSScriptRoot\secrets.ps1") { . "$PSScriptRoot\secrets.ps1" }

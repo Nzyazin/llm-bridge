@@ -1,0 +1,11 @@
+Route voice questions into a persistent Paseo session
+
+Replace per-call `devin -p` with `paseo send` into a fixed Devin agent
+(smart mode) living in the voice-agent workspace: shared context, warm
+prompt cache, transcript visible in Paseo. The regex telegram trigger is
+replaced by a TG_SEND: marker the model emits per AGENTS.md contract;
+permission requests are auto-denied for voice.
+
+README documents the session architecture and the Quasar-side routing
+config on the speaker (classifier off, paseo_call/paseo_short rules,
+ASR-spelled strip prefixes, ssh/control.sh reference).

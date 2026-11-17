@@ -6,4 +6,6 @@ work/
 *.err
 run/bridge.pid
 run/secrets.ps1
+run/voice-agent.id
+run/test-prompt.txt
 .env
