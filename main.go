@@ -35,6 +35,7 @@ type config struct {
 	botToken          string
 	botChatID         string
 	timeout           time.Duration
+	voiceIdleTTL      time.Duration
 	authToken         string
 	proxyURL          string
 	ttsPrefix         string
@@ -61,6 +62,10 @@ func loadConfig() config {
 	if err != nil {
 		classifierTimeout = 6 * time.Second
 	}
+	voiceIdleTTL, err := time.ParseDuration(envOr("VOICE_IDLE_TTL", "30m"))
+	if err != nil {
+		voiceIdleTTL = 30 * time.Minute
+	}
 	return config{
 		listenAddr:        envOr("LISTEN_ADDR", ":8765"),
 		paseoBin:          envOr("PASEO_BIN", "paseo"),
@@ -73,6 +78,7 @@ func loadConfig() config {
 		botToken:          envOr("BOT_TOKEN", ""),
 		botChatID:         envOr("BOT_ID", ""),
 		timeout:           timeout,
+		voiceIdleTTL:      voiceIdleTTL,
 		authToken:         os.Getenv("AUTH_TOKEN"),
 		proxyURL:          os.Getenv("PROXY_URL"),
 		ttsPrefix:         os.Getenv("TTS_PREFIX"),
@@ -128,9 +134,9 @@ func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
 // --- core ---
 
 type bridge struct {
-	cfg    config
-	mu     sync.Mutex // voice turns are serialized: one prompt at a time
-	tgHTTP *http.Client
+	cfg     config
+	mu      sync.Mutex // voice turns are serialized: one prompt at a time
+	tgHTTP  *http.Client
 	agentID string // paseo voice session; guarded by mu
 
 	replyMu  sync.Mutex
@@ -215,10 +221,21 @@ func (b *bridge) loadAgentID() string {
 }
 
 func (b *bridge) saveAgentID(id string) {
-	if err := os.WriteFile(b.cfg.agentFile, []byte(id+"\n"), 0o644); err != nil {
-		log.Printf("agent id save: %v", err)
-	}
 	b.agentID = id
+	b.touchAgentFile()
+}
+
+// touchAgentFile rewrites the id file so its mtime is the last voice turn:
+// the idle-reset check below survives bridge restarts for free.
+func (b *bridge) touchAgentFile() {
+	if err := os.WriteFile(b.cfg.agentFile, []byte(b.agentID+"\n"), 0o644); err != nil {
+		log.Printf("agent id write: %v", err)
+	}
+}
+
+func (b *bridge) voiceStale() bool {
+	st, err := os.Stat(b.cfg.agentFile)
+	return err != nil || time.Since(st.ModTime()) > b.cfg.voiceIdleTTL
 }
 
 // paseoSend delivers the prompt and waits for the turn; the reply itself is
@@ -286,6 +303,16 @@ func (b *bridge) askVoice(ctx context.Context, question string) (string, error) 
 	if b.agentID == "" {
 		b.agentID = b.loadAgentID()
 	}
+	// Long-idle sessions only carry stale context: a fresh one is cheaper
+	// than dragging the whole accumulated timeline into every reply.
+	if b.agentID != "" && b.voiceStale() {
+		log.Printf("voice session idle over %s — resetting", b.cfg.voiceIdleTTL)
+		if _, err := b.paseoCmd(ctx, "delete", b.agentID); err != nil {
+			log.Printf("voice session delete: %v", err)
+		}
+		b.agentID = ""
+		os.Remove(b.cfg.agentFile)
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if b.agentID == "" {
 			id, err := b.createVoiceAgent(ctx)
@@ -296,6 +323,7 @@ func (b *bridge) askVoice(ctx context.Context, question string) (string, error) 
 		}
 		text, err := b.paseoSend(ctx, b.agentID, question)
 		if err == nil {
+			b.touchAgentFile()
 			return text, nil
 		} else if ctx.Err() != nil {
 			return "", fmt.Errorf("paseo timeout after %s", b.cfg.timeout)
